@@ -15,10 +15,12 @@ import torch.optim as optim
 from torch.utils.data import DataLoader
 import torch.nn.functional as F
 from torchvision import transforms
+from torchvision.utils import save_image
 from models import LightweightParallelUNet, ParallelUNet, EfficientUNet
 from dataloader import ParallelUnetDataloader_AIHub  
 from torch.cuda.amp import autocast, GradScaler
 import time
+import os
 
 torch.cuda.empty_cache()
 # Check if CUDA is available
@@ -33,7 +35,7 @@ transform = transforms.Compose([
 ])
 
 # Initialize dataset and dataloader
-json_file = "trainexample/exampled_json_file.json"
+json_file = "trainexample/trainexample/exampled_json_file.json"
 dataset = ParallelUnetDataloader_AIHub(json_file, transform=transform)
 dataloader = DataLoader(dataset, batch_size=1, shuffle=True, pin_memory=True)
 
@@ -219,13 +221,16 @@ model2.to(device)
 scaler = GradScaler()
 
 # Define the number of steps for gradient accumulation
-accumulation_steps = 12  # You can adjust this value
+accumulation_steps = 4  # Reduced for faster feedback on CPU
 
 
 # Training loop
+print("Starting training...")
+print(f"Dataset size: {len(dataset)}")
+print(f"Device: {device}")
 for epoch in range(10):  # 10 epochs
     epoch_start_time = time.time()
-    print(epoch_start_time)
+    print(f"\n=== Starting Epoch {epoch + 1}/10 ===")
     epoch_loss = 0.0
     num_batches = 0
 
@@ -234,6 +239,8 @@ for epoch in range(10):  # 10 epochs
 
     # Wrap your dataloader with tqdm for a progress bar
     for i, (combined_img, person_pose, garment_pose, ic_img, org_img) in enumerate(dataloader):
+        if i == 0:
+            print(f"Batch shapes - combined_img: {combined_img.shape}, person_pose: {person_pose.shape}, garment_pose: {garment_pose.shape}, ic_img: {ic_img.shape}, org_img: {org_img.shape}")
 
         # Move data to the GPU and convert to fp16
         combined_img = combined_img.to(device)
@@ -245,14 +252,21 @@ for epoch in range(10):  # 10 epochs
         # Enable autocast for mixed-precision training
         with autocast():
             # Model 1's forward pass and loss calculation
-            output1 = model1(combined_img, person_pose, garment_pose, ic_img)
+            # Model signature: forward(x, gar_emb, pose_emb, seg_garment)
+            # x: 6-channel concatenated image [person, cloth]
+            # gar_emb: garment embedding (garment_pose landmarks)
+            # pose_emb: pose embedding (person_pose landmarks)
+            # seg_garment: 3-channel garment image
+            output1 = model1(combined_img, garment_pose, person_pose, ic_img)
             loss1 = criterion(output1, org_img)  # Use original person image as the target
 
             # Upsample output1 from 128x128 to 256x256
             output1_upsampled = F.interpolate(output1, size=(256, 256), mode='bilinear', align_corners=True)
 
             # Model 2's forward pass and loss calculation
-            output2 = model2(output1, person_pose, garment_pose, ic_img)  # Using output1 as input to model2
+            # Concatenate output1 with ic_img to maintain 6-channel input for model2
+            output1_concat = torch.cat([output1, ic_img], dim=1)
+            output2 = model2(output1_concat, garment_pose, person_pose, ic_img)  # Using output1 as input to model2
             loss2 = criterion(output2, org_img)
 
             # Combine the losses if needed
@@ -262,8 +276,34 @@ for epoch in range(10):  # 10 epochs
         # Backpropagation using gradient accumulation
         scaler.scale(loss).backward()
 
+        # Print progress more frequently (every batch for first few, then every accumulation step)
+        if i < 3 or (i + 1) % accumulation_steps == 0:
+            print(f"Epoch {epoch + 1}, Batch {i + 1}, Loss: {loss.item() * accumulation_steps:.6f}")
+            
+            # Save visualization images periodically
+            if (i + 1) % 50 == 0:  # Save every 50 batches
+                os.makedirs("results", exist_ok=True)
+                # Denormalize for visualization (reverse ImageNet normalization)
+                mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1).to(device)
+                std = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1).to(device)
+                
+                # Denormalize images
+                org_img_vis = org_img * std + mean
+                output2_vis = output2 * std + mean
+                ic_img_vis = ic_img * std + mean
+                
+                # Combine images for visualization (input, garment, output, target)
+                combined_vis = torch.cat([
+                    ic_img_vis[0:1],  # garment
+                    org_img_vis[0:1],  # target
+                    output2_vis[0:1]   # prediction
+                ], dim=0)
+                
+                save_path = f"results/epoch_{epoch + 1}_batch_{i + 1}.png"
+                save_image(combined_vis, save_path, nrow=3, normalize=False)
+                print(f"  -> Saved visualization to {save_path}")
+
         if (i + 1) % accumulation_steps == 0:  # Wait for several backward steps
-            print(f"Epoch {epoch + 1}, Batch {i + 1}, Loss: {loss.item() * accumulation_steps}")
             scaler.step(optimizer1)  # Performs the optimizer step for model1
             scaler.step(optimizer2)  # Performs the optimizer step for model2
 

@@ -20,16 +20,16 @@ class ParallelUnetDataloader_AIHub(Dataset):
         while True:
             try:
                 data = self.data_list[idx]
-                ia_img_path = os.path.join("trainexample/Ia", data["wearing"])
-                org_img_path = os.path.join("trainexample/resized_org_model", data["wearing"])  # Original person image
+                ia_img_path = os.path.join("trainexample/trainexample/Ia", data["wearing"])
+                org_img_path = os.path.join("trainexample/trainexample/resized_org_model", data["wearing"])  # Original person image
 
 
                 target_top = data['inner_top'] if data['inner_top'] is not None else data['main_top']
 
-                jg_json_path = os.path.join("trainexample/Jg", f"{target_top}_F.json")
-                ic_img_path = os.path.join("trainexample/Ic", f"{target_top}_F.jpg")
+                jg_json_path = os.path.join("trainexample/trainexample/Jg", f"{target_top}_F.json")
+                ic_img_path = os.path.join("trainexample/trainexample/Ic", f"{target_top}_F.jpg")
 
-                jp_json_path = os.path.join("trainexample/Jp", data["wearing"].replace(".jpg", ".json"))
+                jp_json_path = os.path.join("trainexample/trainexample/Jp", data["wearing"].replace(".jpg", ".json"))
 
                 ia_img = Image.open(ia_img_path).convert('RGB')
                 ic_img = Image.open(ic_img_path).convert('RGB')
@@ -45,11 +45,26 @@ class ParallelUnetDataloader_AIHub(Dataset):
                 org_img = Image.open(org_img_path).convert('RGB')  # Load original person image
 
                 if self.transform:
-                    combined_img = self.transform(combined_img)
-                    ic_img = self.transform(ic_img)
-                    org_img = self.transform(org_img)  # Transform original person image
+                    org_img_t = self.transform(org_img)  # Transform original person image (person without clothes)
+                    ic_img_t = self.transform(ic_img)  # Transform cloth image
+                    # Concatenate person and cloth images to create 6-channel input
+                    combined_img = torch.cat([org_img_t, ic_img_t], dim=0)  # Shape: [6, H, W]
+                    ic_img = ic_img_t  # 3-channel garment image for garment_unet
+                    org_img = org_img_t  # 3-channel target image
+                else:
+                    # If no transform, convert to tensors and concatenate
+                    to_tensor = transforms.ToTensor()
+                    org_img_t = to_tensor(org_img)
+                    ic_img_t = to_tensor(ic_img)
+                    combined_img = torch.cat([org_img_t, ic_img_t], dim=0)
+                    ic_img = ic_img_t
+                    org_img = org_img_t
 
-                return ia_img, person_pose, garment_pose, ic_img, org_img
+                # Ensure pose tensors are 1D and float32
+                person_pose = person_pose.flatten().float()  # Shape: [51]
+                garment_pose = garment_pose.flatten().float()  # Shape: [51]
+
+                return combined_img, person_pose, garment_pose, ic_img, org_img
 
             except FileNotFoundError:
                 idx = (idx + 1) % len(self.data_list)  # Move to the next item
